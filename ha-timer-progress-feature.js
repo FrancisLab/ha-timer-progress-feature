@@ -124,21 +124,26 @@ class TimerProgressFeature extends HTMLElement {
     this._fill = this.shadowRoot.querySelector(".fill");
     this._label = this.shadowRoot.querySelector(".label");
 
-    this._toggle.addEventListener("click", (ev) => {
-      ev.stopPropagation();
+    this._toggle.addEventListener("click", () => {
       this._callTimer(this._stateObj?.state === "active" ? "pause" : "start");
     });
-    this._reset.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      // timer.start on an active or paused timer restarts it from its duration.
-      this._callTimer(this._resetAction === "restart" ? "start" : "cancel");
+    this._reset.addEventListener("click", () => {
+      if (this._resetAction === "cancel") {
+        this._callTimer("cancel");
+        return;
+      }
+      // Without a duration, timer.start keeps the stored remaining time: it
+      // resumes a paused timer, and restarts an active one from wherever the
+      // last timer.change left it. Passing the duration starts it over.
+      this._callTimer("start", { duration: this._stateObj?.attributes.duration });
     });
 
     this._pill.addEventListener("pointerdown", (ev) => this._onPointerDown(ev));
     this._pill.addEventListener("pointermove", (ev) => this._onPointerMove(ev));
     this._pill.addEventListener("pointerup", (ev) => this._onPointerUp(ev));
     this._pill.addEventListener("pointercancel", () => this._endDrag(false));
-    // A drag must not also count as a tap on the tile behind the feature.
+    // Neither the buttons nor a drag should also count as a tap on the tile
+    // behind the feature.
     this._pill.addEventListener("click", (ev) => ev.stopPropagation());
   }
 
@@ -182,7 +187,8 @@ class TimerProgressFeature extends HTMLElement {
 
   disconnectedCallback() {
     this._animation?.cancel();
-    this._press = undefined;
+    // Clears the drag styling too, in case HA reattaches this same element.
+    this._endDrag(false);
   }
 
   get _durationMs() {
@@ -197,14 +203,16 @@ class TimerProgressFeature extends HTMLElement {
   }
 
   _update() {
-    const stateObj = this._stateObj;
     // Leave the fill where the finger is until the drag ends.
-    if (!stateObj || !this.isConnected || this._press?.dragging) return;
+    if (!this.isConnected || this._press?.dragging) return;
 
-    const { state } = stateObj;
-    const unavailable = state === "unavailable";
+    // A deleted or renamed entity leaves no state object at all.
+    const state = this._stateObj?.state;
+    const unavailable = !state || state === "unavailable" || state === "unknown";
 
-    this._toggle.querySelector("ha-icon").icon = state === "active" ? "mdi:pause" : "mdi:play";
+    // Attributes rather than the .icon property: if ha-icon isn't defined yet,
+    // a property set now would shadow its accessor once it upgrades.
+    this._toggle.querySelector("ha-icon").setAttribute("icon", state === "active" ? "mdi:pause" : "mdi:play");
     this._toggle.setAttribute("aria-label", state === "active" ? "Pause" : "Start");
     this._toggle.disabled = unavailable;
 
@@ -212,7 +220,7 @@ class TimerProgressFeature extends HTMLElement {
     // Nothing to reset on an idle timer, so drop the button rather than grey it.
     this._reset.hidden = !reset || state === "idle";
     if (reset) {
-      this._reset.querySelector("ha-icon").icon = reset.icon;
+      this._reset.querySelector("ha-icon").setAttribute("icon", reset.icon);
       this._reset.setAttribute("aria-label", reset.label);
       this._reset.disabled = unavailable;
     }
@@ -221,7 +229,7 @@ class TimerProgressFeature extends HTMLElement {
     this._pill.classList.toggle("draggable", state === "active");
 
     const durationMs = this._durationMs;
-    if (!durationMs || state === "idle") {
+    if (unavailable || !durationMs || state === "idle") {
       this._showStatic(0);
     } else if (state === "paused") {
       this._showStatic(this._remainingMs / durationMs);
@@ -260,18 +268,22 @@ class TimerProgressFeature extends HTMLElement {
       const dy = Math.abs(ev.clientY - press.startY);
       if (dx < DRAG_THRESHOLD_PX || dx < dy) return;
       press.dragging = true;
+      // Neither changes during a drag, so read them once rather than per move.
+      press.rect = this._pill.getBoundingClientRect();
+      press.durationMs = this._durationMs;
       this._pill.setPointerCapture(ev.pointerId);
       this._pill.classList.add("dragging");
       this._animation?.cancel();
     }
 
-    const { left, width } = this._pill.getBoundingClientRect();
+    const { left, width } = press.rect;
     const ratio = Math.min(1, Math.max(0, (ev.clientX - left) / width));
     // HA rejects a change past the running duration; stay a second short so
     // client/server clock rounding can't push it over.
-    const maxSeconds = Math.max(0, Math.floor(this._durationMs / 1000) - 1);
-    press.targetSeconds = Math.min(maxSeconds, Math.round((ratio * this._durationMs) / 1000));
-    this._fill.style.transform = `scaleX(${ratio})`;
+    const maxSeconds = Math.max(0, Math.floor(press.durationMs / 1000) - 1);
+    press.targetSeconds = Math.min(maxSeconds, Math.round((ratio * press.durationMs) / 1000));
+    // Fill from the clamped target so the bar and the label always agree.
+    this._fill.style.transform = `scaleX(${(press.targetSeconds * 1000) / press.durationMs})`;
     this._label.textContent = formatSeconds(press.targetSeconds);
   }
 
@@ -304,7 +316,7 @@ class TimerProgressFeature extends HTMLElement {
     }
     // Show the new position right away rather than snapping back while the
     // state update makes its round trip; that update then re-syncs the fill.
-    this._showRunning(target * 1000, this._durationMs);
+    this._showRunning(target * 1000, press.durationMs);
     this._callTimer("change", { duration: delta });
   }
 
@@ -319,12 +331,16 @@ class TimerProgressFeature extends HTMLElement {
   }
 }
 
-customElements.define("timer-progress", TimerProgressFeature);
+// The module can be loaded twice, for example a leftover manual resource next
+// to the Marketplace one; a second define would throw.
+if (!customElements.get("timer-progress")) {
+  customElements.define("timer-progress", TimerProgressFeature);
 
-window.customCardFeatures = window.customCardFeatures || [];
-window.customCardFeatures.push({
-  type: "timer-progress",
-  name: "Timer progress",
-  isSupported: (hass, context) => !!context.entity_id?.startsWith("timer."),
-  configurable: false,
-});
+  window.customCardFeatures = window.customCardFeatures || [];
+  window.customCardFeatures.push({
+    type: "timer-progress",
+    name: "Timer progress",
+    isSupported: (hass, context) => !!context.entity_id?.startsWith("timer."),
+    configurable: false,
+  });
+}
